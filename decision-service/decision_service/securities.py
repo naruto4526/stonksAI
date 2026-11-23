@@ -133,7 +133,13 @@ class SecurityMaster:
             return isin, self.by_isin[isin]
         if filing.isin:
             return filing.isin.upper(), None
-        return f"name:{key}", None
+        if key:
+            return f"name:{key}", None
+        # No name at all (some BSE fund filings): fall back to the exchange's code, or keep the
+        # filing on its own rather than lumping every nameless filing into one "company".
+        if filing.symbol:
+            return f"{filing.exchange.lower()}:{filing.symbol}", None
+        return f"unknown:{filing.exchange.lower()}:{filing.source_id}", None
 
 
 def download(directory: str | Path = DEFAULT_DIR, client: HttpClient | None = None) -> list[tuple[str, int, str]]:

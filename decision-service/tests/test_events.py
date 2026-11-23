@@ -58,6 +58,26 @@ class ClassifyTests(unittest.TestCase):
             ("Disclosure Under Regulation 51", "", "routine"),
             (None, "Current Expense Ratio as on 18-11-2026", "routine"),
             (None, "The Exchange has received the disclosure under Regulation 29(2) of SEBI (Substantial Acquisition of Shares and Takeovers)", "shareholding"),
+            # Mention results but aren't results
+            (None, "Earnings Call Transcript", "routine"),
+            (None, "K.P. Energy Limited submitted the Exchange transcript of Earnings Conference Call held on November 13, 2026 for the financial results", "routine"),
+            (None, "Newspaper publication of Quarterly unaudited financial results for the quarter ended September 30, 2026", "routine"),
+            ("Board Meeting Intimation", "to consider and approve the unaudited financial results", "routine"),
+            ("Board Meeting Intimation", "Board Meeting to be held on 27-Nov-2026 to consider Fund Raising", "fund_raise"),
+            (None, "Intimation of Board Meeting to consider proposal for Buyback of equity shares", "capital_return"),
+            (None, "Ganesh Holdings Ltd has informed BSE that the meeting of the Board of Directors of the Company is scheduled on "
+                   "23/11/2026, inter alia, to consider the proposal for raising funds by way of an issue of equity shares on a rights basis",
+             "fund_raise"),
+            (None, "has informed BSE that the meeting of the Board of Directors of the Company is scheduled on 26/11/2026 to consider "
+                   "the appointment of an Additional Director (Non-Executive, Independent)", "routine"),
+            (None, "We wish to inform you that the company has scheduled a Conference Call with Analysts / Investors", "routine"),
+            (None, "The company has fixed Regulation 60(2) Record Date Interest Payment / Redemption / Dividend", "routine"),
+            ("Outcome of Board Meeting", "Axis Bank has submitted the financial results for the quarter ended September 2026", "results"),
+            # Orders
+            (None, "Receipt of work of order from Indian Oil Limited.", "order_win"),
+            (None, "The company has received an order from the Hon'ble Supreme Court in the matter", "legal_regulatory"),
+            (None, "Secured new orders worth Rs 120 crore", "order_win"),
+            ("Updates", "Demand Notice received from Dy. Commissioner, CGST", "legal_regulatory"),
         ]
         for subject, headline, expected in cases:
             with self.subTest(subject=subject, headline=headline):
@@ -176,6 +196,201 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(self.store.events()[0]["backlog"], 1)
 
 
+class CrossExchangeTests(unittest.TestCase):
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.tracker = EventTracker(self.store, master(), run_id=1)
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_copies_pair_across_exchanges_despite_types_and_nse_type_wins(self):
+        a = self.tracker.process(bse("AXIS Bank Ltd", "Execution of Power Purchase Agreement", THU, "a.pdf", "532215"), THU)
+        b = self.tracker.process(nse("Axis Bank Limited", "Bagging/Receiving of orders/contracts", "execution of Power Purchase Agreement",
+                                     THU + timedelta(seconds=47), "A.pdf"), THU)
+        self.assertEqual((a.event_type, b.event_type), ("agreement", "order_win"))
+        self.assertEqual(a.event_id, b.event_id)
+        event = self.store.events()[0]
+        self.assertEqual((event["event_type"], event["type_exchange"]), ("order_win", "NSE"))
+
+    def test_nse_type_is_kept_when_bse_copy_disagrees(self):
+        self.tracker.process(nse("Axis Bank Limited", "Bagging/Receiving of orders/contracts", "", THU, "A.pdf"), THU)
+        self.tracker.process(bse("AXIS Bank Ltd", "Execution of Power Purchase Agreement", THU + timedelta(minutes=1), "a.pdf", "532215"), THU)
+        self.assertEqual(self.store.events()[0]["event_type"], "order_win")
+
+    def test_routine_looking_copy_never_hides_news(self):
+        self.tracker.process(nse("Axis Bank Limited", "Disclosure Under Regulation 51", "Disclosure Under Regulation 51", THU, "R.pdf"), THU)
+        self.assertEqual(self.store.events()[0]["status"], "routine")
+        self.tracker.process(bse("AXIS Bank Ltd", "Reaffirmation of Credit Rating and Revision in Outlook", THU + timedelta(seconds=20), "r.pdf", "532215"), THU)
+        event = self.store.events()[0]
+        self.assertEqual((event["event_type"], event["status"]), ("credit_rating", "new"))
+
+    def test_readable_routine_copy_names_an_unreadable_event(self):
+        self.tracker.process(bse("AXIS Bank Ltd", "As per attachment", THU, "n.pdf", "532215"), THU)
+        self.tracker.process(nse("Axis Bank Limited", "Copy of Newspaper Publication", "", THU + timedelta(minutes=3), "N.pdf"), THU)
+        event = self.store.events()[0]
+        self.assertEqual((event["event_type"], event["status"]), ("routine", "routine"))
+
+    def test_decided_event_is_not_reopened(self):
+        a = self.tracker.process(nse("Axis Bank Limited", "Disclosure Under Regulation 51", "", THU, "R.pdf"), THU)
+        self.store.update_event(a.event_id, status="decided")
+        self.tracker.process(bse("AXIS Bank Ltd", "Reaffirmation of Credit Rating", THU + timedelta(seconds=20), "r.pdf", "532215"), THU)
+        self.assertEqual(self.store.events()[0]["status"], "decided")
+
+    def test_close_copy_from_other_exchange_beats_far_event_of_same_type(self):
+        update = self.tracker.process(nse("Axis Bank Limited", "Press Release", "", THU, "P.pdf"), THU)
+        order = self.tracker.process(nse("Axis Bank Limited", "Bagging/Receiving of orders/contracts", "", THU + timedelta(minutes=50), "O.pdf"), THU)
+        copy = self.tracker.process(bse("AXIS Bank Ltd", "Updates", THU + timedelta(minutes=52), "o.pdf", "532215"), THU)
+        self.assertEqual(copy.event_type, "order_win")
+        self.assertEqual(copy.event_id, order.event_id)
+        self.assertNotEqual(copy.event_id, update.event_id)
+
+    def test_second_filing_on_the_same_exchange_stays_separate(self):
+        a = self.tracker.process(nse("Axis Bank Limited", "Change in Directors/KMP", "Resignation of CFO", THU, "M.pdf"), THU)
+        b = self.tracker.process(bse("AXIS Bank Ltd", "Resignation of CFO", THU + timedelta(minutes=2), "m.pdf", "532215"), THU)
+        c = self.tracker.process(bse("AXIS Bank Ltd", "Investor Presentation", THU + timedelta(minutes=8), "p.pdf", "532215"), THU)
+        self.assertEqual(a.event_id, b.event_id)
+        self.assertNotEqual(a.event_id, c.event_id)
+
+    def test_names_written_differently_on_each_exchange(self):
+        m = SecurityMaster()
+        m.load_text("SYMBOL,NAME OF COMPANY,ISIN NUMBER\nFEDERALBNK,The Federal Bank  Limited,INE171A01029\n"
+                    "WSI,W S Industries (I) Limited,INE100D01014\nTHEMISMED,Themis Medicare Limited,INE083B01024\n")
+        self.assertEqual(m.resolve(bse("Federal Bank Ltd", "", THU, "f.pdf", "500469"))[0], "INE171A01029")
+        self.assertEqual(m.resolve(bse("W. S. Industries (India) Ltd", "", THU, "w.pdf", "504220"))[0], "INE100D01014")
+        self.assertEqual(m.resolve(bse("Themis Medicare Ltd", "", THU, "t.pdf", "530199"))[0], "INE083B01024")
+
+    def test_nameless_filings_are_not_lumped_together(self):
+        a = self.tracker.process(bse("", "NAV as on 17-11-2026", THU, "n1.pdf", "9012103"), THU)
+        b = self.tracker.process(bse("", "NAV as on 17-11-2026", THU, "n2.pdf", "9012208"), THU)
+        self.assertEqual((a.company_id, b.company_id), ("bse:9012103", "bse:9012208"))
+        self.assertNotEqual(a.event_id, b.event_id)
+
+    def test_equity_bse_code_is_preferred(self):
+        # PTC Industries is in NSE's list but not the BSE fixture, so codes come from the feed
+        self.tracker.process(bse("PTC Industries Ltd", "Updates", THU, "d.pdf", "976177"), THU)  # a bond code
+        self.assertEqual(self.store.events()[0]["bse_code"], "976177")
+        self.tracker.process(bse("PTC Industries Ltd", "Updates", THU + timedelta(minutes=1), "e.pdf", "539006"), THU)
+        self.tracker.process(bse("PTC Industries Ltd", "Updates", THU + timedelta(minutes=2), "f.pdf", "973171"), THU)
+        self.assertEqual(self.store.events()[0]["bse_code"], "539006")
+
+
+class RepeatTests(unittest.TestCase):
+    """The same filing seen again goes to the event it already belongs to."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "db.sqlite")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def see(self, tracker, run_id, filing, at, backlog=False):
+        """What the poller does: store the sighting, group it, write the link."""
+        self.store.record_sightings(run_id, [filing], at, backlog=backlog)
+        outcome = tracker.process(filing, at, backlog=backlog)
+        self.store.set_sighting_events(run_id, [(filing.source, filing.source_id, outcome.event_id, outcome.company_id, outcome.event_type)])
+        return outcome
+
+    def piramal_copies(self):
+        presentation = nse("Axis Bank Limited", "Investor Presentation", "has informed the Exchange about Investor Presentation",
+                           THU, "AXIS_INVESTOR_DAY.pdf")
+        legacy = nse("Axis Bank Limited", "Investor Presentation", "has informed the Exchange about Investor Presentation",
+                     THU, "AXIS_INVESTOR_DAY.pdf")
+        legacy.source = "nse_rss_legacy"
+        legacy.attachment_url = "https://nsearchives.nseindia.in/corporate/AXIS_INVESTOR_DAY.pdf"  # same file, other host
+        bse_copy = bse("AXIS Bank Ltd", "Investor Presentation to be made at the Investor Day and Investor & Analyst Day",
+                       THU - timedelta(minutes=2), "guid-1.pdf", "532215")
+        return presentation, legacy, bse_copy
+
+    def test_second_feed_copy_is_a_repeat_not_a_copy(self):
+        run = self.store.start_run(["nse_rss", "nse_rss_legacy"])
+        tracker = EventTracker(self.store, master(), run)
+        presentation, legacy, _ = self.piramal_copies()
+        a = self.see(tracker, run, presentation, THU)
+        b = self.see(tracker, run, legacy, THU + timedelta(seconds=20))
+        self.assertEqual(a.event_id, b.event_id)
+        self.assertTrue(b.repeat)
+        event = self.store.events()[0]
+        self.assertEqual(event["copies"], 1)
+        self.assertEqual(event["sources"], "nse_rss,nse_rss_legacy")
+
+    def test_restart_rereads_join_the_same_event_even_when_their_own_type_differs(self):
+        run2 = self.store.start_run(["nse_rss", "bse_rss"])
+        tracker = EventTracker(self.store, master(), run2)
+        presentation, _, bse_copy = self.piramal_copies()
+        self.see(tracker, run2, presentation, THU)
+        joined = self.see(tracker, run2, bse_copy, THU + timedelta(minutes=1))
+        self.assertEqual(classify(bse_copy.subject, bse_copy.headline), "routine")  # the copy alone looks routine
+        self.assertEqual(joined.event_type, "update")  # the event took NSE's type
+
+        # Restart: a fresh tracker, and the first poll re-reads both filings as backlog
+        run3 = self.store.start_run(["nse_rss", "bse_rss"])
+        restarted = EventTracker(self.store, master(), run3)
+        late = THU + timedelta(hours=13)
+        again_bse = self.see(restarted, run3, bse("AXIS Bank Ltd", bse_copy.headline, bse_copy.published_at, "guid-1.pdf", "532215"),
+                             late, backlog=True)
+        again_nse = self.see(restarted, run3, nse("Axis Bank Limited", "Investor Presentation", presentation.headline, THU,
+                                                  "AXIS_INVESTOR_DAY.pdf"), late, backlog=True)
+        self.assertEqual({again_bse.event_id, again_nse.event_id}, {joined.event_id})
+        self.assertTrue(again_bse.repeat and again_nse.repeat)
+        events = self.store.events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]["copies"], events[0]["event_type"]), (2, "update"))
+
+        # A rebuild gives the same answer
+        rebuild_events(self.store, master())
+        events = self.store.events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["copies"], 2)
+
+    def test_same_file_name_for_another_company_is_not_a_repeat(self):
+        run = self.store.start_run(["nse_rss"])
+        tracker = EventTracker(self.store, master(), run)
+        a = self.see(tracker, run, nse("Axis Bank Limited", "Press Release", "", THU, "release.pdf"), THU)
+        b = self.see(tracker, run, nse("PTC Industries Limited", "Press Release", "", THU, "release.pdf"), THU)
+        self.assertNotEqual(a.event_id, b.event_id)
+        self.assertFalse(b.repeat)
+
+    def test_one_pdf_shared_by_many_fund_schemes(self):
+        """BSE posts one NAV PDF as a separate item per scheme, a second apart."""
+        def scheme(name, second):
+            f = bse(name, "NAV as on 18-11-2026", THU + timedelta(seconds=second), "nav-guid.pdf", f"90121{second:02d}")
+            f.source_id = f"nav-guid.pdf@19-Nov-2026 10:00:{second:02d}"
+            return f
+        names = ["UTI Mid Cap Fund Regular Plan Growth", "UTI Liquid Fund Regular Plan Growth", "UTI Gilt Fund Direct Plan"]
+        run2 = self.store.start_run(["bse_rss"])
+        tracker = EventTracker(self.store, master(), run2)
+        first = {n: self.see(tracker, run2, scheme(n, i), THU).event_id for i, n in enumerate(names)}
+        self.assertEqual(len(set(first.values())), 3)
+        run3 = self.store.start_run(["bse_rss"])
+        restarted = EventTracker(self.store, master(), run3)
+        for i, n in reversed(list(enumerate(names))):
+            again = self.see(restarted, run3, scheme(n, i), THU + timedelta(hours=13), backlog=True)
+            self.assertEqual(again.event_id, first[n])
+            self.assertTrue(again.repeat)
+        # The same item listed without a name joins the event it belonged to
+        nameless = scheme("", 0)
+        self.assertEqual(self.see(restarted, run3, nameless, THU + timedelta(hours=13), backlog=True).event_id, first[names[0]])
+
+    def test_rebuild_from_a_run_also_rebuilds_later_runs(self):
+        runs = [self.store.start_run(["nse_rss"]) for _ in range(3)]
+        tracker = EventTracker(self.store, master(), runs[0])
+        self.see(tracker, runs[0], nse("PTC Industries Limited", "Press Release", "", THU - timedelta(days=1), "old.pdf"),
+                 THU - timedelta(days=1))
+        for run in runs[1:]:
+            tracker.run_id = run
+            self.see(tracker, run, nse("Axis Bank Limited", "Press Release", "", THU, "new.pdf"), THU, backlog=run == runs[2])
+        first_event = self.store.events()[0]["id"]
+        rebuild_events(self.store, master(), run_id=runs[1])
+        event_ids = {e["id"] for e in self.store.events()}
+        self.assertIn(first_event, event_ids)  # run 1 left alone
+        linked = {s["event_id"] for run in runs for s in self.store.sightings(run)}
+        self.assertTrue(linked <= event_ids)  # nothing points at a deleted event
+        self.assertEqual(len(event_ids), 2)
+
+
 class ScriptedSource(Source):
     def __init__(self, name, exchange, results):
         self.name, self.exchange = name, exchange
@@ -251,6 +466,8 @@ class PollerAndRebuildTests(unittest.TestCase):
             store = Store(path)
             columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(sightings)")}
             self.assertTrue({"company_id", "event_type", "event_id"} <= columns)
+            event_columns = {r["name"] for r in store._conn.execute("PRAGMA table_info(events)")}
+            self.assertIn("type_exchange", event_columns)
             self.assertEqual(rebuild_events(store, master()), 1)
             self.assertEqual(store.events()[0]["company_id"], "INE238A01034")
             store.close()

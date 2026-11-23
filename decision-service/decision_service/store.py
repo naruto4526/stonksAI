@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS sightings (
     UNIQUE (run_id, source, source_id)
 );
 CREATE INDEX IF NOT EXISTS sightings_run_key ON sightings(run_id, match_key);
+CREATE INDEX IF NOT EXISTS sightings_exchange_item ON sightings(exchange, source_id);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id TEXT NOT NULL,
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS events (
     bse_code TEXT,
     company TEXT,
     event_type TEXT NOT NULL,
+    type_exchange TEXT,
     session_date TEXT NOT NULL,
     in_market_hours INTEGER NOT NULL DEFAULT 0,
     news_time TEXT,
@@ -88,8 +90,9 @@ CREATE INDEX IF NOT EXISTS events_company_session ON events(company_id, session_
 
 # Columns added after the first release; older databases get them on open.
 SIGHTING_MIGRATIONS = {"company_id": "TEXT", "event_type": "TEXT", "event_id": "INTEGER"}
+EVENT_MIGRATIONS = {"type_exchange": "TEXT"}
 EVENT_COLUMNS = (
-    "company_id", "isin", "nse_symbol", "bse_code", "company", "event_type", "session_date",
+    "company_id", "isin", "nse_symbol", "bse_code", "company", "event_type", "type_exchange", "session_date",
     "in_market_hours", "news_time", "first_seen_at", "first_source", "first_run_id", "copies",
     "sources", "exchanges", "status", "backlog",
 )
@@ -111,6 +114,10 @@ class Store:
             for column, kind in SIGHTING_MIGRATIONS.items():
                 if column not in existing:
                     self._conn.execute(f"ALTER TABLE sightings ADD COLUMN {column} {kind}")
+            existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(events)")}
+            for column, kind in EVENT_MIGRATIONS.items():
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE events ADD COLUMN {column} {kind}")
             self._conn.execute("CREATE INDEX IF NOT EXISTS sightings_event ON sightings(event_id)")
             self._conn.commit()
 
@@ -189,6 +196,19 @@ class Store:
             return self._conn.total_changes - before
 
     # Events ------------------------------------------------------------------------
+    def get_event(self, event_id: int) -> sqlite3.Row | None:
+        rows = self._query("SELECT * FROM events WHERE id = ?", (event_id,))
+        return rows[0] if rows else None
+
+    def linked_event(self, exchange: str, source_id: str) -> sqlite3.Row | None:
+        """The event an earlier sighting of this exact item (same exchange, file and timestamp) belongs to."""
+        rows = self._query(
+            """SELECT e.* FROM sightings s JOIN events e ON e.id = s.event_id
+               WHERE s.exchange = ? AND s.source_id = ? ORDER BY s.id LIMIT 1""",
+            (exchange, source_id),
+        )
+        return rows[0] if rows else None
+
     def find_events(self, company_id: str, session_date: str) -> list[sqlite3.Row]:
         return self._query(
             "SELECT * FROM events WHERE company_id = ? AND session_date = ? ORDER BY id", (company_id, session_date)
@@ -230,15 +250,20 @@ class Store:
                  for source, source_id, event_id, company_id, event_type in links],
             )
 
-    def clear_events(self, run_id: int | None = None) -> None:
+    def clear_events(self, from_run: int | None = None) -> None:
+        """Delete events and unlink sightings, for all runs or for one run and every later run.
+
+        Later runs go too because their sightings can belong to events an earlier run created.
+        """
         with self._lock, self._conn:
-            if run_id is None:
+            if from_run is None:
                 self._conn.execute("DELETE FROM events")
                 self._conn.execute("UPDATE sightings SET event_id = NULL, company_id = NULL, event_type = NULL")
             else:
-                self._conn.execute("DELETE FROM events WHERE first_run_id = ?", (run_id,))
+                self._conn.execute("DELETE FROM events WHERE first_run_id >= ?", (from_run,))
                 self._conn.execute(
-                    "UPDATE sightings SET event_id = NULL, company_id = NULL, event_type = NULL WHERE run_id = ?", (run_id,)
+                    "UPDATE sightings SET event_id = NULL, company_id = NULL, event_type = NULL WHERE run_id >= ?",
+                    (from_run,),
                 )
 
     def events(self, run_id: int | None = None) -> list[sqlite3.Row]:

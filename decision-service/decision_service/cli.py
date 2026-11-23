@@ -138,6 +138,8 @@ def cmd_poll(args) -> int:
                 tag = ""
             elif filing.event_is_new:
                 tag = f"  [new {filing.event_type} event #{filing.event_id}]"
+            elif filing.event_repeat:
+                tag = f"  [same file as event #{filing.event_id}]"
             else:
                 tag = f"  [copy of event #{filing.event_id}]"
             print(f"{fmt_ist(result.finished_at)}  {source.name:<14} lag {lag}  {filing.company[:38]:<38}  {topic[:50]}{tag}")
@@ -239,7 +241,7 @@ def cmd_events(args) -> int:
     if args.rebuild:
         master = securities_mod.SecurityMaster.load_dir(args.securities_dir)
         count = rebuild_events(store, master, args.run)
-        scope = f"run {args.run}" if args.run else "all runs"
+        scope = f"run {args.run} onward" if args.run else "all runs"
         print(f"Rebuilt events for {scope} from {count:,} filings ({len(master):,} securities loaded).")
     rows = store.events(args.run)
     if args.type:

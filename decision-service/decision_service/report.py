@@ -218,11 +218,13 @@ def _events_summary(store: Store, run_id: int, sightings) -> dict | None:
         if e["first_seen_at"] and e["news_time"]
     ]
     run_sightings = [s for s in sightings if s["event_id"] is not None and not s["backlog"]]
+    filings = {(s["exchange"], s["source_id"]) for s in run_sightings}  # NSE's two feeds carry the same items
     return {
         "live_events": len(live),
         "by_type": dict(Counter(e["event_type"] for e in live).most_common()),
-        "live_filings": len(run_sightings),
-        "copies_absorbed": max(0, len(run_sightings) - len(live)),
+        "live_filings": len(filings),
+        "repeat_sightings": len(run_sightings) - len(filings),
+        "copies_absorbed": max(0, len(filings) - len(live)),
         "with_isin": sum(1 for e in live if not e["company_id"].startswith("name:")),
         "both_exchanges": len(both),
         "first_on": dict(first_on),
@@ -370,7 +372,8 @@ def format_report(report: dict) -> str:
         out += [
             "",
             "EVENTS (copies of one filing grouped by company, event type and trading session)",
-            f"  {ev['live_events']:,} new events from {ev['live_filings']:,} filings: {ev['copies_absorbed']:,} copies joined an existing event",
+            f"  {ev['live_events']:,} new events from {ev['live_filings']:,} filings: {ev['copies_absorbed']:,} copies joined an existing event"
+            f" ({ev.get('repeat_sightings', 0):,} more sightings were the same items on a second feed)",
             f"  by type: {types}",
             f"  company identified by ISIN for {ev['with_isin']:,} of {ev['live_events']:,}; {ev['in_market_hours']:,} arrived in market hours",
         ]

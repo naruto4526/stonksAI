@@ -58,20 +58,99 @@ It prints each new filing with its lag, a status line every minute, and the repo
 the end. Ctrl+C stops it early and still prints the report. Results go to
 `data\sources.sqlite`. Keep the PC from sleeping while it runs.
 
-Useful options:
+Both feeds hold only today's filings, from midnight IST. A filing published after the
+poller stops is still picked up (as backlog) if you restart before midnight, but it is
+gone once the day rolls over. Evenings matter, because many companies file results after
+the close. To catch everything, keep it running past midnight: started at 09:00,
+`--duration 15h30m` runs until 00:30.
+
+### Commands
+
+| Command | What it's for |
+| --- | --- |
+| `py -m decision_service sources` | The sources, their default intervals and whether they're official |
+| `py -m decision_service securities` | How many companies are loaded for ISIN matching (`--download` refreshes NSE's lists) |
+| `py -m decision_service poll --duration 6h45m` | Poll and record. Prints each new filing, a heartbeat every minute and the report at the end |
+| `py -m decision_service runs` | Recorded runs: id, start time (UTC) and sources |
+| `py -m decision_service report` | Health and lag per source, feed comparisons and the events summary for the latest run (`--run 2` for another run, `--json` for raw numbers) |
+| `py -m decision_service events` | The latest non-routine events (`--run 2`, `--live`, `--multi`, `--type results`, `--include-routine`, `--limit 0` for all) |
+| `py -m decision_service events --rebuild` | Regroup recorded filings into events (`--run 3` for run 3 onward) |
+| `py -m unittest discover -s tests -t .` | The tests |
+
+Options for `poll`:
 
 ```powershell
-py -m decision_service poll --interval nse_rss=3 --quiet       # change an interval, hide per-filing lines
-py -m decision_service report                                   # report on the latest run again
-py -m decision_service report --run 2 --json                    # a specific run, raw numbers
-py -m decision_service runs                                     # list recorded runs
+py -m decision_service poll --quiet --heartbeat 5m     # no per-filing lines, a status line every 5 minutes
+py -m decision_service poll --interval nse_rss=3       # change a poll interval
+py -m decision_service poll --no-events                # record filings without grouping them into events
+py -m decision_service -v poll --duration 30m          # also log every warning and retry
+py -u -m decision_service poll --duration 15h30m 2>&1 | Tee-Object -FilePath data\poll.log   # keep a copy of the output
 ```
+
+In Git Bash, end that last command with `| tee data/poll.log` instead. `-u` stops Python
+buffering its output, so lines reach the log as they are printed.
 
 To include the unofficial JSON endpoints for a short comparison (your call, see above):
 
 ```powershell
 py -m decision_service poll --sources nse_rss,nse_json,bse_rss,bse_api --allow-unofficial --duration 1h
 ```
+
+### Checking that the poller works
+
+**Before a run**
+
+1. `py -m unittest discover -s tests -t .` ends with `OK`.
+2. `py -m decision_service securities` shows about 3,200 securities. If it shows none, run
+   `py -m decision_service securities --download`.
+3. Stop the PC sleeping while plugged in: `powercfg /change standby-timeout-ac 0`.
+   Afterwards, set it back with a number of minutes, e.g. `powercfg /change standby-timeout-ac 30`.
+
+**A 10-minute test**, best during market hours, when filings arrive every minute or so:
+
+```powershell
+py -m decision_service poll --duration 10m
+```
+
+- The start says `Grouping filings into events, 3,215 securities loaded`. If it says
+  "by company name" instead, the company lists aren't loaded.
+- Each source's first poll is the day so far. It is stored as backlog and nothing is
+  printed for it.
+- After that, every new filing prints one line: time, source, lag, company, subject and a tag.
+  - `[new results event #12]`: a new event.
+  - `[copy of event #12]`: another copy of a filing already in that event, usually from the other exchange.
+  - `[same file as event #12]`: the same item on NSE's second feed. Every NSE filing shows up twice.
+- Lags of 1 to 3 minutes are normal in market hours. On 19 Nov, while the PC was awake,
+  the median was 84 s for BSE and 131 s for NSE.
+- The heartbeat line, once a minute: polls go up for every source, errors stay at or near
+  0, and `last` is 200 or 304. `nse_rss` answers 304 ("unchanged") most of the time;
+  `bse_rss` never does.
+
+**Warning signs**
+
+- Heartbeat lines missing for some minutes: the PC slept. Lags measured after that are inflated.
+- `getaddrinfo failed` or another `URLError`: no network, often just after waking. The
+  poller retries on its own, waiting longer each time.
+- HTTP 403 or 429: the exchange is throttling. The poller waits at least 60 s. If it keeps
+  happening, raise the intervals.
+- An occasional HTTP 406 from BSE (twice on 19 Nov) is harmless.
+- One source's `new` count stops rising during market hours while the others keep going:
+  that feed has stalled. NSE's did, from 09:18 to 09:59 on 19 Nov. The report's
+  `max behind` shows how far it fell behind.
+
+**After a run**, run `py -m decision_service report`:
+
+- PER SOURCE: few errors. A `lag max` measured in hours means the PC slept or a feed stalled.
+- SAME EXCHANGE: `missed by A` and `missed by B` should both be 0.
+- EVENTS: "more sightings were the same items on a second feed" should be close to the
+  number of NSE filings, since each NSE filing arrives on both NSE feeds.
+- `py -m decision_service events --live --limit 20`: skim the types. Companies listed on
+  both exchanges should mostly show `copies 2` and `BSE,NSE`.
+
+**After a restart**, the new run re-reads the whole day, and those filings should go back
+to their existing events. About a minute after restarting, run
+`py -m decision_service events --run <new run id> --include-routine`. It lists the events the
+new run created; their times should all be after the previous run stopped.
 
 ## Events: one decision per filing
 
@@ -83,22 +162,45 @@ they arrive hours later. Each event keeps the earliest exchange timestamp of any
 its news time.
 
 - **Company:** the ISIN, looked up in NSE's lists of listed equities (and BSE's list of
-  scrips, if you import it). Without the lists it falls back to the normalised company
-  name, which works for most companies but misses ones named differently on each exchange.
+  scrips, if you import it). With only NSE's lists, every company is found by name:
+  lowercase, "&" as "and", without "Limited"/"Ltd", a leading "The" or punctuation, and
+  "(I)" read as "(India)". No match: the company ID is `name:<that name>`; a filing with
+  no name at all uses its exchange code (`bse:9012103`). `bse_code` prefers the company's
+  equity code (5xxxxx) over its bond codes.
 - **Event type:** from keywords in the subject and headline: `results`,
   `merger_acquisition`, `shareholding`, `order_win`, `agreement`, `fund_raise`,
   `capital_return`, `credit_rating`, `legal_regulatory`, `management`, `update`,
-  `routine`, or `other` when nothing matches. Routine filings (newspaper notices, trading
-  window, NAV, meeting schedules, debenture-trustee letters and so on) get status
-  `routine`, so the decision step can skip them.
+  `routine`, or `other` when nothing matches. Rules are checked in order and the first
+  match wins. Filings that mention results without being them (call transcripts and
+  recordings, call schedules, newspaper copies, board-meeting notices) are checked first
+  and count as routine, except board-meeting notices about a buyback, bonus, split,
+  dividend, fund raise or merger. Routine filings get status `routine`, so the decision
+  step can skip them.
 - **Trading session:** a filing between 09:15 and 15:30 on a weekday belongs to that day;
   before the open, to the same day; after the close or at a weekend, to the next weekday.
   Exchange holidays are not modelled yet.
-- **Matching:** results merge across the whole session (a company files results once a
-  day). Other types merge when the copies' exchange timestamps are within 60 minutes, so
-  two separate updates on one day stay separate. A copy whose type can't be read ("As per
-  attachment" is common on BSE) joins the company's nearest event within 30 minutes and
-  takes its type.
+- **Seen before:** a filing already linked to an event is recognised exactly and goes
+  straight back to that event. NSE's `.in` and `.com` feeds carry the same items, and
+  every restart re-reads the day. The identity is the exchange plus the item's
+  `source_id`: attachment file name and exchange timestamp. The file name alone isn't
+  unique, because BSE posts one PDF as a separate item per mutual-fund scheme. The
+  company must match too, unless the repeat has no company name. A repeat isn't a new
+  copy: `copies` counts distinct items.
+- **Matching:** a new copy joins one of the company's events in the same session if
+  - it has the same type: results anywhere in the session (a company files results once
+    a day), other types within 60 minutes, so two separate updates on one day stay apart;
+  - or either type is `other` ("As per attachment" is common on BSE), within 30 minutes;
+  - or it comes from the other exchange, within 30 minutes, whatever the types: the NSE
+    and BSE copies of one filing often classify differently. The event must not already
+    have a copy from that exchange.
+
+  The closest eligible event wins, with a type mismatch counted as 10 extra minutes.
+- **When copies disagree on the type:** the more specific one wins (unreadable, then
+  routine, then a vague update, then anything specific), so a copy that looks routine
+  never hides one that doesn't. Between two specific types, NSE's wins, because it is a
+  category the company picked from NSE's list rather than BSE's free text.
+  `type_exchange` records which exchange's copy set the type. Once an event's status is
+  past `new`/`routine`, a late copy doesn't change it.
 
 Set up the company lists once, and again now and then for new listings:
 
@@ -119,6 +221,7 @@ py -m decision_service poll --duration 6h45m        # groups while polling: [new
 py -m decision_service events                       # latest events, routine ones hidden
 py -m decision_service events --type results --multi   # results seen on both exchanges
 py -m decision_service events --rebuild             # regroup every recorded run (after loading lists or changing rules)
+py -m decision_service events --rebuild --run 3     # regroup run 3 and every later run; earlier runs stay as they are
 ```
 
 `poll --no-events` turns grouping off. Runs recorded before this existed have no events
@@ -151,13 +254,23 @@ and company names otherwise, which is approximate.
 
 ## Grouping on the 19 Nov run
 
-Backfilled with name matching only (the company lists weren't loaded):
+Regrouped on 21 Nov with NSE's company lists loaded and the matching rules above:
 
-- 1,822 live filings became 801 events; 1,021 copies joined an existing event.
-- 534 events were routine, 56 unreadable (`other`), 267 non-routine.
-- 162 events appeared on both exchanges: BSE first for 82, NSE first for 80, median 159 s
+- Run 2's 1,822 live sightings were 1,203 distinct filings; the other 619 were the same
+  items on NSE's second feed. They became 790 events: 413 copies joined an existing event.
+- 556 events were routine, 48 unreadable (`other`), 186 typed and non-routine.
+  311 events were matched to an ISIN; most of the rest are mutual funds, bonds and
+  companies listed only on BSE.
+- 173 events appeared on both exchanges: BSE first for 90, NSE first for 83, median 168 s
   between the copies.
-- Non-routine events were first seen a median 129 s after the earliest exchange timestamp.
+- Across all three runs, NSE-only and BSE-only events of the same company within 30
+  minutes of each other (likely missed copies) fell from 57 to 1, and that one is two
+  different companies with similar names.
+- Run 3 re-read 2,321 filings that run 2 had already seen; all but 3 went back to their
+  earlier event. The 3 are mutual-fund NAV items whose scheme name BSE's feed changed
+  between the runs.
+- In a sample of 60 company events, 56 had the right type, 1 was wrong and 3 were debatable.
+- Non-routine events were first seen a median 140 s after the earliest exchange timestamp.
   The p90 (about 48 minutes) includes the stretch when the PC slept, so it overstates the lag.
 - Where one company had several non-routine events in a session, spot checks showed
   genuinely separate filings (for example a CFO resignation in the morning and a director's
