@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from . import documents as documents_mod
 from . import securities as securities_mod
 from .events import EventTracker, rebuild_events
 from .http import DEFAULT_USER_AGENT, HttpClient
@@ -267,6 +268,43 @@ def cmd_events(args) -> int:
     return 0
 
 
+def cmd_documents(args) -> int:
+    import importlib.util
+
+    if not Path(args.db).exists():
+        raise SystemExit(f"No database at {args.db}. Run the 'poll' command first.")
+    universe = None
+    if args.universe != "all":
+        if not Path(args.universe).exists():
+            raise SystemExit(f"No universe file at {args.universe}. Pass --universe all to test every company.")
+        universe = documents_mod.load_universe(args.universe)
+    store = Store(args.db)
+    attachments = documents_mod.select_attachments(store, universe, args.limit, args.seed)
+    store.close()
+    if not attachments:
+        print("No attachments to test: no non-routine events with attachments in that universe.")
+        return 1
+    scope = "every company" if universe is None else f"{len(universe):,} companies in {args.universe}"
+    print(f"Testing {len(attachments)} attachments from {len({a.event_id for a in attachments})} non-routine events "
+          f"({scope}), one request every {args.delay:g} s. Files are saved in {args.out}.")
+    if importlib.util.find_spec("pypdf") is None:
+        print(documents_mod.PDF_LIB_MISSING)
+    client = HttpClient(user_agent=args.user_agent, timeout=args.timeout)
+    records: list[dict] = []
+    try:
+        documents_mod.run_test(client, attachments, args.out, delay=args.delay, refetch=args.refetch, records=records)
+    except KeyboardInterrupt:
+        print("\nStopped early: summarising what was tested.")
+    if not records:
+        return 1
+    summary = documents_mod.summarize(records)
+    print()
+    print(documents_mod.format_summary(summary))
+    path = documents_mod.save_report(records, summary, args.out)
+    print(f"\nFull results: {path}")
+    return 0
+
+
 def cmd_runs(args) -> int:
     if not Path(args.db).exists():
         raise SystemExit(f"No database at {args.db}.")
@@ -328,6 +366,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=50, help="how many events to print (default 50)")
     p.add_argument("--securities-dir", default=str(securities_mod.DEFAULT_DIR))
     p.set_defaults(func=cmd_events)
+
+    p = sub.add_parser("documents", help="test downloading and reading the attachments of recorded events")
+    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--limit", type=int, default=100, help="attachments to test (default 100)")
+    p.add_argument("--universe", default=str(documents_mod.DEFAULT_UNIVERSE),
+                   help="file of ISINs to test, or 'all' (default: the Nifty 500 list)")
+    p.add_argument("--out", default=str(documents_mod.DEFAULT_OUT), help="folder for the downloaded files and the report")
+    p.add_argument("--delay", type=float, default=1.0, help="seconds between requests (default 1)")
+    p.add_argument("--timeout", type=float, default=60.0, help="seconds to wait for one download")
+    p.add_argument("--seed", type=int, default=7, help="which random sample to take")
+    p.add_argument("--refetch", action="store_true", help="download again even if the file is already saved")
+    p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    p.set_defaults(func=cmd_documents)
 
     p = sub.add_parser("runs", help="list recorded runs")
     p.add_argument("--db", default=str(DEFAULT_DB))

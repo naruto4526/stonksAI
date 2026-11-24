@@ -75,6 +75,7 @@ the close. To catch everything, keep it running past midnight: started at 09:00,
 | `py -m decision_service report` | Health and lag per source, feed comparisons and the events summary for the latest run (`--run 2` for another run, `--json` for raw numbers) |
 | `py -m decision_service events` | The latest non-routine events (`--run 2`, `--live`, `--multi`, `--type results`, `--include-routine`, `--limit 0` for all) |
 | `py -m decision_service events --rebuild` | Regroup recorded filings into events (`--run 3` for run 3 onward) |
+| `py -m decision_service documents` | Test downloading and reading the attachments of recorded events (see Document test) |
 | `py -m unittest discover -s tests -t .` | The tests |
 
 Options for `poll`:
@@ -227,6 +228,33 @@ py -m decision_service events --rebuild --run 3     # regroup run 3 and every la
 `poll --no-events` turns grouping off. Runs recorded before this existed have no events
 until you run `events --rebuild` once.
 
+## Document test
+
+Before the decision step reads filings, this measures what reading them costs. It takes
+recorded non-routine events of Nifty 500 companies, results first, and downloads each
+event's attachments: the NSE and BSE copies, NSE's XBRL files and any ZIPs. It sends one
+request a second under the tool's own user agent, and for each attachment records:
+
+- whether the download worked, and how long it took;
+- what the file really is: a PDF, XBRL, a ZIP, or an HTML error page instead of a document;
+- for PDFs, the pages, the text that comes out, how long reading it took, and whether it
+  looks scanned (under 100 characters a page);
+- for XBRL, whether it carries financial figures such as revenue and profit.
+
+From those numbers it estimates the input tokens per decision and the monthly cost on Claude
+Haiku 5.5 and Sonnet 5.5. It also checks whether an event's NSE and BSE PDFs are the same file.
+
+```powershell
+py -m pip install pypdf                       # once: reads PDF text
+py -m decision_service documents              # about 100 attachments, a few minutes
+py -m decision_service documents --limit 300 --universe all   # a bigger sample, every company
+```
+
+Files go to `data\documents\nse` and `data\documents\bse`, and the full results to
+`data\documents\document-test-<time>.json`. A second run reads the saved files rather than
+downloading them again (`--refetch` downloads them anyway). Ctrl+C stops it and still prints
+the summary.
+
 ## Reading the report
 
 - For each exchange, prefer the official source with no missed filings and an acceptable
@@ -283,6 +311,7 @@ decision_service/
   models.py      Filing: the record every later stage uses
   securities.py  company lists: ISIN, NSE symbol, BSE code, name
   events.py      event types, trading sessions, grouping copies into events
+  documents.py   the document test: download attachments, read PDFs and XBRL, estimate tokens
   sources/       one adapter per source; subclass Source and register it in sources/__init__.py
   http.py        gzip, conditional GET, timing
   poller.py      one thread per source, baseline + de-duplication, back-off, event grouping

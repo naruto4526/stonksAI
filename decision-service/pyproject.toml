@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []  # standard library only, so far
 
+[project.optional-dependencies]
+documents = ["pypdf>=4"]  # reading PDF text in the document test
+
 [project.scripts]
 stonks-sources = "decision_service.cli:main"
 

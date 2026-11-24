@@ -266,6 +266,10 @@ class Store:
                     (from_run,),
                 )
 
+    def event_copies(self, event_id: int) -> list[sqlite3.Row]:
+        """Every sighting linked to an event, in the order they were seen."""
+        return self._query("SELECT * FROM sightings WHERE event_id = ? ORDER BY detected_at, id", (event_id,))
+
     def events(self, run_id: int | None = None) -> list[sqlite3.Row]:
         if run_id is None:
             return self._query("SELECT * FROM events ORDER BY news_time, id")
