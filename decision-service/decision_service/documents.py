@@ -47,7 +47,7 @@ FINANCIAL_FACTS = {
     "ProfitLossFromContinuingOperations", "ProfitLossForThePeriod",
     "BasicEarningsLossPerShareFromContinuingOperations", "ComprehensiveIncomeForThePeriod",
 }
-PDF_LIB_MISSING = "pypdf is not installed: only downloads are measured. Install it with: py -m pip install pypdf"
+PDF_LIB_MISSING = 'pypdf is not installed: only downloads are measured. Install it with: py -m pip install "pypdf[crypto]"'
 
 
 def load_universe(path: str | Path) -> set[str]:
@@ -159,7 +159,10 @@ def inspect_pdf(body: bytes) -> dict:
         info["scanned"] = bool(chars) and sum(chars) / len(chars) < SCANNED_CHARS_PER_PAGE
         info["tokens_est"] = round(sum(chars) / CHARS_PER_TOKEN)
     except Exception as exc:
-        info["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        if "cryptography" in str(exc):  # AES-encrypted, even with an empty password
+            info["error"] = 'encrypted: install the crypto extra, py -m pip install "pypdf[crypto]"'
+        else:
+            info["error"] = f"{type(exc).__name__}: {exc}"[:200]
     info["extract_ms"] = round((time.perf_counter() - started) * 1000, 1)
     return info
 
@@ -345,14 +348,14 @@ def summarize(records: list[dict]) -> dict:
             per = sum(_cost(t, model) for t in event_tokens) / len(event_tokens)
             costs[model] = {"per_event_usd": round(per, 5), "per_month_usd": round(per * EVENTS_PER_MONTH, 2)}
 
-    # NSE and BSE copies of the same event: the same file, or at least the same words?
+    # NSE and BSE copies of the same event: is any NSE PDF the very same file as a BSE one?
     pairs = []
-    by_event: dict[int, dict[str, dict]] = {}
+    by_event: dict[int, dict[str, set]] = {}
     for r in pdfs:
-        by_event.setdefault(r["event_id"], {}).setdefault(r["exchange"], r)
+        by_event.setdefault(r["event_id"], {}).setdefault(r["exchange"], set()).add(r["sha256"])
     for copies in by_event.values():
         if "NSE" in copies and "BSE" in copies:
-            pairs.append(copies["NSE"]["sha256"] == copies["BSE"]["sha256"])
+            pairs.append(bool(copies["NSE"] & copies["BSE"]))
 
     xmls = [r for r in ok if r.get("xml")]
     zips = [r for r in ok if r.get("zip")]

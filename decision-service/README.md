@@ -45,6 +45,39 @@ cd D:\repos\stonksAI\decision-service
 py -m decision_service sources
 ```
 
+## Database: PostgreSQL
+
+The commands use PostgreSQL when `STONKS_DB`, in `.env` or the environment, is a
+`postgresql://` URL, and the SQLite file `data\sources.sqlite` otherwise. The tests use SQLite,
+and `tests/test_postgres.py` also runs against Postgres when it is up.
+
+Set up once (Docker Desktop must be running):
+
+```powershell
+cd D:\repos\stonksAI\decision-service
+py -m pip install "psycopg[binary]"         # the PostgreSQL driver
+docker compose up -d                        # PostgreSQL 17 on 127.0.0.1:15432 (POSTGRES_PORT in .env), data in the stonks-pgdata volume
+docker compose ps                           # wait until it says "healthy"
+py -m decision_service migrate              # copy data\sources.sqlite into Postgres
+py -m unittest tests.test_postgres -v       # 5 tests against Postgres, each in a throwaway schema
+```
+
+`.env` holds the database password, generated on this PC; git ignores it, and `.env.example`
+shows the format. Postgres listens on this PC only (127.0.0.1) and restarts with Docker
+Desktop. It uses port 15432 because Windows often reserves 5432 for Hyper-V and WSL
+(`netsh interface ipv4 show excludedportrange protocol=tcp` lists the reserved ranges).
+`STONKS_DB` uses 127.0.0.1 rather than localhost: on Windows, localhost tries IPv6 `::1` first,
+which Docker doesn't listen on, so every connection waited 10 seconds or more
+(`py -m decision_service dbcheck` shows connection and query times). The SQLite file is left as it was, as a backup; `--db data\sources.sqlite` points any
+command back at it.
+
+```powershell
+docker compose exec postgres psql -U stonks -d stonks                    # an SQL prompt
+docker compose exec postgres pg_dump -U stonks -Fc stonks -f /tmp/stonks.dump
+docker compose cp postgres:/tmp/stonks.dump data\stonks.dump               # a backup on this PC
+docker compose down                                                       # stop; the data stays
+```
+
 ## Run a comparison
 
 Run it during market hours on a trading day (09:00 to 15:30 IST), ideally in results season.
@@ -75,6 +108,8 @@ the close. To catch everything, keep it running past midnight: started at 09:00,
 | `py -m decision_service report` | Health and lag per source, feed comparisons and the events summary for the latest run (`--run 2` for another run, `--json` for raw numbers) |
 | `py -m decision_service events` | The latest non-routine events (`--run 2`, `--live`, `--multi`, `--type results`, `--include-routine`, `--limit 0` for all) |
 | `py -m decision_service events --rebuild` | Regroup recorded filings into events (`--run 3` for run 3 onward) |
+| `py -m decision_service dbcheck` | Is the database reachable, how many rows each table has, and how long a round trip takes |
+| `py -m decision_service migrate` | Copy `data\sources.sqlite` into PostgreSQL (`--replace` empties the target first) |
 | `py -m decision_service documents` | Test downloading and reading the attachments of recorded events (see Document test) |
 | `py -m unittest discover -s tests -t .` | The tests |
 
@@ -245,7 +280,7 @@ From those numbers it estimates the input tokens per decision and the monthly co
 Haiku 5.5 and Sonnet 5.5. It also checks whether an event's NSE and BSE PDFs are the same file.
 
 ```powershell
-py -m pip install pypdf                       # once: reads PDF text
+py -m pip install "pypdf[crypto]"             # once: reads PDF text, including encrypted PDFs
 py -m decision_service documents              # about 100 attachments, a few minutes
 py -m decision_service documents --limit 300 --universe all   # a bigger sample, every company
 ```
@@ -315,7 +350,7 @@ decision_service/
   sources/       one adapter per source; subclass Source and register it in sources/__init__.py
   http.py        gzip, conditional GET, timing
   poller.py      one thread per source, baseline + de-duplication, back-off, event grouping
-  store.py       SQLite for now (Postgres later)
+  store.py       PostgreSQL, or SQLite for tests; the SQL is written once for both
   report.py      the comparison
   cli.py         python -m decision_service ...
 tests/           py -m unittest discover -s tests -t .

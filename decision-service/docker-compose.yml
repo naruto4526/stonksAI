@@ -1,0 +1,25 @@
+# Local PostgreSQL for the decision service.
+#   docker compose up -d      start it (keeps running across restarts of Docker Desktop)
+#   docker compose ps         check it is healthy
+#   docker compose down       stop it; the data stays in the stonks-pgdata volume
+services:
+  postgres:
+    image: postgres:17
+    container_name: stonks-postgres
+    environment:
+      POSTGRES_DB: stonks
+      POSTGRES_USER: stonks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"  # reachable from this PC only
+    volumes:
+      - stonks-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stonks -d stonks"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  stonks-pgdata:

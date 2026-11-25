@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -23,10 +24,33 @@ from .http import DEFAULT_USER_AGENT, HttpClient
 from .poller import Poller
 from .report import build_report, format_report
 from .sources import DEFAULT_SOURCES, SOURCES, Source
-from .store import Store
+from .store import TABLES, Store, copy_database, describe_target, is_postgres_url
 from .timeutil import fmt_ist, from_iso, utcnow
 
 DEFAULT_DB = Path("data") / "sources.sqlite"
+DB_HELP = "SQLite file or postgresql:// URL (default: STONKS_DB from the environment or .env, else data/sources.sqlite)"
+
+
+def load_env_file(path: str | Path = ".env") -> None:
+    """Read KEY=VALUE lines from a .env file into the environment, without overriding what is set."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def default_db() -> str:
+    return os.environ.get("STONKS_DB") or str(DEFAULT_DB)
+
+
+def require_db(target: str, hint: str = " Run the 'poll' command first.") -> None:
+    if not is_postgres_url(target) and not Path(target).exists():
+        raise SystemExit(f"No database at {target}.{hint}")
 
 UNOFFICIAL_WARNING = """\
 WARNING: you enabled unofficial sources ({names}).
@@ -158,7 +182,7 @@ def cmd_poll(args) -> int:
             )
     poller = Poller(store, sources, run_id, on_new=on_new, tracker=tracker)
     print(f"Run {run_id}: polling {', '.join(f'{s.name} every {s.interval:g}s' for s in sources)}")
-    print(f"Saving to {Path(args.db).resolve()}. The first poll of each source is a baseline. Press Ctrl+C to stop.")
+    print(f"Saving to {describe_target(args.db)}. The first poll of each source is a baseline. Press Ctrl+C to stop.")
     poller.start()
 
     deadline = time.monotonic() + args.duration if args.duration else None
@@ -186,8 +210,7 @@ def cmd_poll(args) -> int:
 
 
 def cmd_report(args) -> int:
-    if not Path(args.db).exists():
-        raise SystemExit(f"No database at {args.db}. Run the 'poll' command first.")
+    require_db(args.db)
     store = Store(args.db)
     try:
         report = build_report(
@@ -236,8 +259,7 @@ def cmd_securities(args) -> int:
 
 
 def cmd_events(args) -> int:
-    if not Path(args.db).exists():
-        raise SystemExit(f"No database at {args.db}. Run the 'poll' command first.")
+    require_db(args.db)
     store = Store(args.db)
     if args.rebuild:
         master = securities_mod.SecurityMaster.load_dir(args.securities_dir)
@@ -271,8 +293,7 @@ def cmd_events(args) -> int:
 def cmd_documents(args) -> int:
     import importlib.util
 
-    if not Path(args.db).exists():
-        raise SystemExit(f"No database at {args.db}. Run the 'poll' command first.")
+    require_db(args.db)
     universe = None
     if args.universe != "all":
         if not Path(args.universe).exists():
@@ -305,9 +326,90 @@ def cmd_documents(args) -> int:
     return 0
 
 
+def cmd_migrate(args) -> int:
+    require_db(args.source, "")
+    target = args.target or default_db()
+    if target == args.source:
+        raise SystemExit("Nothing to do: the source and the target are the same database. Set STONKS_DB or pass --to.")
+    source_store, target_store = Store(args.source), Store(target)
+    print(f"Copying {describe_target(args.source)}\n     to {describe_target(target)}")
+    try:
+        counts = copy_database(source_store, target_store, replace=args.replace)
+    except ValueError as exc:
+        raise SystemExit(f"Not copied: {exc}. Pass --replace to empty the target first.")
+    for table, n in counts.items():
+        expected = source_store.count(table)
+        print(f"  {table:<10} {n:>7,} rows{'' if n == expected else f' (source has {expected:,})'}")
+    source_store.close()
+    target_store.close()
+    return 0
+
+
+def _timings(fn, n: int) -> list[float]:
+    out = []
+    for _ in range(n):
+        started = time.perf_counter()
+        fn()
+        out.append((time.perf_counter() - started) * 1000)
+    return out
+
+
+def _ms(values: list[float]) -> str:
+    ordered = sorted(values)
+    return f"median {ordered[len(ordered) // 2]:,.1f} ms, max {ordered[-1]:,.1f} ms (n={len(values)})"
+
+
+def cmd_dbcheck(args) -> int:
+    """Is the database reachable, what is in it, and how long does a round trip take?"""
+    require_db(args.db, "")
+    started = time.perf_counter()
+    store = Store(args.db)
+    opened_ms = (time.perf_counter() - started) * 1000
+    print(f"Database: {describe_target(args.db)} (opened in {opened_ms:,.0f} ms)")
+    print("  rows: " + ", ".join(f"{table} {store.count(table):,}" for table in TABLES))
+    print(f"  query through the store: {_ms(_timings(lambda: store._query('SELECT 1 AS x'), args.n))}")
+    store.close()
+    if not is_postgres_url(args.db):
+        return 0
+
+    import socket
+    from urllib.parse import urlsplit
+
+    import psycopg
+
+    parts = urlsplit(args.db)
+    variants = [("as configured", args.db)]
+    if parts.hostname == "localhost":
+        found = sorted({info[4][0] for info in socket.getaddrinfo("localhost", parts.port or 5432, type=socket.SOCK_STREAM)})
+        print(f"  localhost resolves to: {', '.join(found)}")
+        variants.append(("via 127.0.0.1", args.db.replace("@localhost:", "@127.0.0.1:", 1)))
+    connect_ms = {}
+    for label, url in variants:
+        connects = _timings(lambda: psycopg.connect(url, autocommit=True, connect_timeout=10).close(), 3)
+        connect_ms[label] = sorted(connects)[1]
+        conn = psycopg.connect(url, autocommit=True, connect_timeout=10)
+        row = conn.execute("SELECT current_setting('server_version')").fetchone()
+        version = row[0] if isinstance(row, tuple) else next(iter(row.values()))
+        selects = _timings(lambda: conn.execute("SELECT 1").fetchall(), args.n)
+
+        def write():  # what every store write costs in round trips: BEGIN, the statement, COMMIT
+            with conn.transaction():
+                conn.execute("SELECT 1").fetchall()
+
+        writes = _timings(write, args.n)
+        conn.close()
+        print(f"  {label}: PostgreSQL {version}")
+        print(f"    connect: {', '.join(f'{x:,.0f} ms' for x in connects)}")
+        print(f"    query round trip: {_ms(selects)}")
+        print(f"    write in a transaction: {_ms(writes)}")
+    if connect_ms.get("as configured", 0) > 1000 and connect_ms.get("via 127.0.0.1", 1e9) < 200:
+        print("  Connecting through localhost is slow here (it tries IPv6 ::1 first). "
+              "Use 127.0.0.1 instead of localhost in STONKS_DB.")
+    return 0
+
+
 def cmd_runs(args) -> int:
-    if not Path(args.db).exists():
-        raise SystemExit(f"No database at {args.db}.")
+    require_db(args.db, "")
     store = Store(args.db)
     for run in store.runs():
         print(f"{run['id']:>4}  {run['started_at']}  {run['sources']}")
@@ -329,7 +431,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=parse_duration, help="stop after e.g. 30m or 6h30m (default: until Ctrl+C)")
     p.add_argument("--interval", action="append", metavar="NAME=SECONDS", help="override a poll interval, e.g. nse_rss=3")
     p.add_argument("--url", action="append", metavar="NAME=URL", help="override a source URL (for testing)")
-    p.add_argument("--db", default=str(DEFAULT_DB), help=f"SQLite file (default: {DEFAULT_DB})")
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
     p.add_argument("--allow-unofficial", action="store_true", help="permit the unofficial JSON endpoints")
     p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     p.add_argument("--heartbeat", type=parse_duration, default=60.0, help="status line interval (0 to disable)")
@@ -340,7 +442,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_poll)
 
     p = sub.add_parser("report", help="compare sources for a recorded run")
-    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
     p.add_argument("--run", type=int, help="run id (default: latest)")
     p.add_argument("--json", action="store_true", help="print the raw numbers as JSON")
     p.add_argument("--session-hours", type=float, default=6.5, help="session length for bandwidth projection")
@@ -356,7 +458,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_securities)
 
     p = sub.add_parser("events", help="list events, or rebuild them from recorded filings")
-    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
     p.add_argument("--rebuild", action="store_true", help="regroup recorded filings into events")
     p.add_argument("--run", type=int, help="limit to one run")
     p.add_argument("--type", help="only this event type (results, order_win, ...)")
@@ -368,7 +470,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_events)
 
     p = sub.add_parser("documents", help="test downloading and reading the attachments of recorded events")
-    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
     p.add_argument("--limit", type=int, default=100, help="attachments to test (default 100)")
     p.add_argument("--universe", default=str(documents_mod.DEFAULT_UNIVERSE),
                    help="file of ISINs to test, or 'all' (default: the Nifty 500 list)")
@@ -380,8 +482,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     p.set_defaults(func=cmd_documents)
 
+    p = sub.add_parser("migrate", help="copy a SQLite database into PostgreSQL (or any other store)")
+    p.add_argument("--from", dest="source", default=str(DEFAULT_DB), help=f"database to copy (default: {DEFAULT_DB})")
+    p.add_argument("--to", dest="target", help="database to copy into (default: STONKS_DB)")
+    p.add_argument("--replace", action="store_true", help="empty the target's tables first")
+    p.set_defaults(func=cmd_migrate)
+
+    p = sub.add_parser("dbcheck", help="check the database: reachable, row counts, round-trip time")
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
+    p.add_argument("-n", type=int, default=20, help="queries to time (default 20)")
+    p.set_defaults(func=cmd_dbcheck)
+
     p = sub.add_parser("runs", help="list recorded runs")
-    p.add_argument("--db", default=str(DEFAULT_DB))
+    p.add_argument("--db", default=default_db(), help=DB_HELP)
     p.set_defaults(func=cmd_runs)
     return parser
 
@@ -392,6 +505,7 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(errors="replace")  # Windows consoles can't print every company name
         except (AttributeError, ValueError):
             pass
+    load_env_file()  # STONKS_DB and friends, before the defaults are read
     args = make_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.ERROR,

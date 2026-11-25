@@ -105,5 +105,16 @@ class CliTests(unittest.TestCase):
             self.assertIn("results", text)
 
 
+    def test_dbcheck_on_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "check.sqlite")
+            Store(db).close()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(main(["dbcheck", "--db", db, "-n", "3"]), 0)
+            self.assertIn("rows: runs 0, polls 0, sightings 0, events 0", out.getvalue())
+            self.assertIn("query through the store: median", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
